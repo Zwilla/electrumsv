@@ -96,7 +96,7 @@ class TestWalletKeystoreAddressIntegrity(unittest.TestCase):
         self.assertEqual(w.get_change_addresses()[0],
                          Address.from_string('1KSezYMhAJMWqFbVFB2JshYg69UpmEXR4D'))
 
-    @mock.patch.object(storage.WalletStorage, '_write')
+    @mock.patch.object(storage.WalletStorage, '_store._write')
     def test_electrum_seed_old(self, mock_write):
         seed_words = 'powerful random nobody notice nothing important anyway look away hidden message over'
         self.assertEqual(bitcoin.seed_type(seed_words), 'old')

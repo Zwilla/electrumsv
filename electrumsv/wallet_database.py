@@ -129,10 +129,10 @@ def byte_repr(value):
 class BaseWalletStore:
     _table_name = None
 
-    def __init__(self, table_name: str, wallet_path: str, aeskey: bytes, group_id: int,
+    def __init__(self, table_name: str, wallet_path: str, aeskey: Optional[bytes], group_id: int,
             migration_context: Optional[MigrationContext]=None) -> None:
-        self._aes_key = aeskey[:16]
-        self._aes_iv = aeskey[16:]
+        self.set_aeskey(aeskey)
+
         self._group_id = group_id
         self._dbs: Dict[int, sqlite3.Connection] = {}
 
@@ -162,6 +162,16 @@ class BaseWalletStore:
         for db in self._dbs.values():
             db.close()
         self._dbs = None
+
+    def set_aeskey(self, aeskey: Optional[bytes]) -> None:
+        if aeskey is None:
+            self._aes_key = None
+            self._aes_iv = None
+
+            self._encrypt = self._decrypt = self._encrypt_nop
+        else:
+            self._aes_key = aeskey[:16]
+            self._aes_iv = aeskey[16:]
 
     def _set_table_name(self, table_name: str) -> None:
         self._table_name = table_name
@@ -212,6 +222,9 @@ class BaseWalletStore:
         if row is not None and row[0] is not None:
             self._write_timestamp = max(row[0], self._write_timestamp)
 
+    def _encrypt_nop(self, value: bytes) -> bytes:
+        return value
+
     def _encrypt(self, value: bytes) -> bytes:
         return bitcoinx.aes.aes_encrypt_with_iv(self._aes_key, self._aes_iv, value)
 
@@ -230,11 +243,35 @@ class BaseWalletStore:
         db.commit()
 
 
-class GenericKeyValueStore(BaseWalletStore):
-    _encrypt_key = BaseWalletStore._encrypt_hex
-    _decrypt_key = BaseWalletStore._decrypt_hex
+class StringKeyMixin:
+    def _encode_key(self, key: str) -> bytes:
+        return super()._encode_key(key.encode())
 
-    def __init__(self, table_name: str, wallet_path: str, aeskey: bytes,
+    def _decode_key(self, key_data: bytes) -> str:
+        key_bytes = super()._decode_key(key_data)
+        return key_bytes.decode('utf-8')
+
+
+class HexKeyMixin:
+    def _encode_key(self, key: str) -> bytes:
+        key_bytes = bytes.fromhex(key)
+        return super()._encode_key(key_bytes)
+
+    def _decode_key(self, key_data: bytes) -> str:
+        key_bytes = super()._decode_key(key_data)
+        return key_bytes.hex()
+
+
+class EncryptedKeyMixin:
+    def _encode_key(self, key_bytes: bytes) -> bytes:
+        return self._encrypt(key_bytes)
+
+    def _decode_key(self, key_data: bytes) -> bytes:
+        return self._decrypt(key_data)
+
+
+class GenericKeyValueStore(BaseWalletStore):
+    def __init__(self, table_name: str, wallet_path: str, aeskey: Optional[bytes],
             group_id: int, migration_context: Optional[MigrationContext]=None) -> None:
         self._logger = logs.get_logger(f"{table_name}-store")
 
@@ -340,10 +377,37 @@ class GenericKeyValueStore(BaseWalletStore):
         return None
 
     @tprofiler
+    def get_many_values(self, keys: Iterable[str]) -> List[Tuple[str, bytes]]:
+        db = self._get_db()
+        query = self._READ_ALL_SQL
+        params = [ self._group_id ]
+
+        results = []
+        def _collect_results(cursor, results):
+            rows = cursor.fetchall()
+            cursor.close()
+            for row in rows:
+                key = self._decrypt_key(row[0])
+                bytedata = self._decrypt(row[1])
+                results.append((key, bytedata))
+
+        ekeys = [ self._encrypt_key(key) for key in keys ]
+        batch_size = MAX_VARS - len(params)
+        while len(ekeys):
+            batch_ekeys = ekeys[:batch_size]
+            batch_query = (query +
+                " AND Key IN ({0})".format(",".join("?" for k in batch_ekeys)))
+            cursor = db.execute(batch_query, params + batch_ekeys)
+            _collect_results(cursor, results)
+            ekeys = ekeys[batch_size:]
+
+        return results
+
+    @tprofiler
     def get_all(self) -> Optional[bytes]:
         db = self._get_db()
         cursor = db.execute(self._READ_ALL_SQL, [ self._group_id ])
-        return [ (self._decrypt_hex(row[0]), self._decrypt(row[1])) for row in cursor.fetchall() ]
+        return [ (self._decrypt_key(row[0]), self._decrypt(row[1])) for row in cursor.fetchall() ]
 
     @tprofiler
     def get_values(self, key: str) -> List[bytes]:
@@ -373,6 +437,20 @@ class GenericKeyValueStore(BaseWalletStore):
         db.execute(self._UPDATE_SQL, [evalue, timestamp, self._group_id, ekey])
         db.commit()
         self._logger.debug("updated '%s'", key)
+
+    @tprofiler
+    def update_many(self, entries: Iterable[Tuple[str, bytes]]) -> None:
+        timestamp = self._get_current_timestamp()
+        datas = []
+        for key, value in entries:
+            assert type(value) is bytes
+            datas.append([ self._group_id, self._encrypt_key(key), self._encrypt(value),
+                timestamp, timestamp])
+        self._write_timestamp = timestamp
+        db = self._get_db()
+        db.executemany(self._UPDATE_SQL, datas)
+        db.commit()
+        self._logger.debug("update_many '%s'", list(t[0] for t in entries))
 
     @tprofiler
     def delete(self, key: str) -> None:
@@ -419,6 +497,34 @@ class GenericKeyValueStore(BaseWalletStore):
             GROUP BY Key, ByteData
         ) AND GroupId=?
         """, self._group_id, self._group_id)
+
+    def _encrypt_key(self, key: str) -> bytes:
+        return self._encode_key(key)
+
+    def _decrypt_key(self, key_data: bytes) -> str:
+        return self._decode_key(key_data)
+
+    def _encode_key(self, key: Any) -> bytes:
+        assert type(key) is bytes
+        return key
+
+    def _decode_key(self, key_data: bytes) -> Any:
+        return key_data
+
+
+class JSONKeyValueStore(GenericKeyValueStore):
+    def get(self, key: str, value: Any=None) -> Any:
+        db_value = self.get_value(key)
+        return value if db_value is None else json.loads(db_value)
+
+    def set(self, key: str, value: Any) -> None:
+        byte_value = json.dumps(value).encode()
+
+        # TODO: DB: There is no underlying set/upsert operation.
+        if self.get_value(key) is None:
+            self.add(key, byte_value)
+        else:
+            self.update(key, byte_value)
 
 
 StoreObject = Union[list, dict]
@@ -484,8 +590,9 @@ class DBTxInput(namedtuple("DBTxInputTuple", "address_string prevout_tx_hash pre
     pass
 
 
-class TransactionInputStore(GenericKeyValueStore, AbstractTransactionXput):
-    def __init__(self, wallet_path: str, aeskey: bytes,
+class TransactionInputStore(HexKeyMixin, EncryptedKeyMixin, GenericKeyValueStore,
+        AbstractTransactionXput):
+    def __init__(self, wallet_path: str, aeskey: Optional[bytes],
             group_id: int, migration_context: Optional[MigrationContext]=None) -> None:
         super().__init__("TransactionInputs", wallet_path, aeskey, group_id, migration_context)
 
@@ -534,8 +641,9 @@ class DBTxOutput(namedtuple("DBTxOutputTuple", "address_string out_tx_n amount i
     pass
 
 
-class TransactionOutputStore(GenericKeyValueStore, AbstractTransactionXput):
-    def __init__(self, wallet_path: str, aeskey: bytes,
+class TransactionOutputStore(HexKeyMixin, EncryptedKeyMixin, GenericKeyValueStore,
+        AbstractTransactionXput):
+    def __init__(self, wallet_path: str, aeskey: Optional[bytes],
             group_id: int, migration_context: Optional[MigrationContext]=None) -> None:
         super().__init__("TransactionOutputs", wallet_path, aeskey, group_id, migration_context)
 
@@ -668,7 +776,7 @@ class TransactionStore(BaseWalletStore):
     outputs.
     """
 
-    def __init__(self, wallet_path: str, aeskey: bytes, group_id: int,
+    def __init__(self, wallet_path: str, aeskey: Optional[bytes], group_id: int,
             migration_context: Optional[MigrationContext]=None) -> None:
         self._logger = logs.get_logger("tx-store")
 

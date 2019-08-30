@@ -66,15 +66,31 @@ class _GKVTestableStore(wallet_database.GenericKeyValueStore):
         return self.timestamp
 
 
+TEST_TABLE_NAME = "test_table"
+TEST_AESKEY = bytes.fromhex("6fce243e381fe158b5e6497c6deea5db5fbc1c6f5659176b9c794379f97269b4")
+
+class TestJSONKeyValueStore:
+    @classmethod
+    def setup_class(cls) -> None:
+        cls.temp_dir = tempfile.TemporaryDirectory()
+        db_path = os.path.join(cls.temp_dir.name, "test")
+
+        cls.db_values = wallet_database.JSONKeyValueStore(TEST_TABLE_NAME, db_path, TEST_AESKEY, 0)
+
+    @classmethod
+    def teardown_class(cls) -> None:
+        del cls.db_values
+
+    def test_get_nonexistent(self) -> None:
+        assert self.db_values.get(b"nonexistent") is None
+
+
 class TestGenericKeyValueStore(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp_dir = tempfile.TemporaryDirectory()
         db_filename = os.path.join(cls.temp_dir.name, "test")
-        table_name = "test_table"
-        aeskey_hex = "6fce243e381fe158b5e6497c6deea5db5fbc1c6f5659176b9c794379f97269b4"
-        aeskey = bytes.fromhex(aeskey_hex)
-        cls.store = _GKVTestableStore(table_name, db_filename, aeskey, 0)
+        cls.store = _GKVTestableStore(TEST_TABLE_NAME, db_filename, TEST_AESKEY, 0)
 
     @classmethod
     def tearDownClass(cls):
@@ -92,7 +108,7 @@ class TestGenericKeyValueStore(unittest.TestCase):
         pass
 
     def test_add(self):
-        k = os.urandom(10).hex()
+        k = os.urandom(10)
         v = os.urandom(10)
 
         self.assertEqual(self.store.get_write_timestamp(), 0)
@@ -110,8 +126,23 @@ class TestGenericKeyValueStore(unittest.TestCase):
         self.assertEqual(row[1], row[2]) # DateCreated == DateUpdated
         self.assertIsNone(row[3]) # DateDeleted
 
+    def test_add_many(self):
+        kvs = [ (os.urandom(10), os.urandom(10)) for i in range(10) ]
+
+        self.assertEqual(self.store.get_write_timestamp(), 0)
+
+        self.store.timestamp = 1
+        self.store.add_many(kvs)
+
+        self.assertEqual(self.store.get_write_timestamp(), 1)
+
+        kvs2 = self.store.get_many_values([ k for (k, v) in kvs ])
+        self.assertEqual(len(kvs), len(kvs2))
+        for t in kvs:
+            self.assertTrue(t in kvs2)
+
     def test_get(self):
-        k = os.urandom(10).hex()
+        k = os.urandom(10)
         v = os.urandom(10)
         self.store.add(k, v)
         byte_data = self.store.get_value(k)
@@ -119,7 +150,7 @@ class TestGenericKeyValueStore(unittest.TestCase):
         self.assertEqual(byte_data, v)
 
     def test_update(self):
-        k = os.urandom(10).hex()
+        k = os.urandom(10)
         v1 = os.urandom(10)
 
         self.store.timestamp = 1
@@ -143,7 +174,7 @@ class TestGenericKeyValueStore(unittest.TestCase):
         self.assertIsNone(row[3]) # DateDeleted
 
     def test_delete(self):
-        k = os.urandom(10).hex()
+        k = os.urandom(10)
         v = os.urandom(10)
 
         self.store.timestamp = 1

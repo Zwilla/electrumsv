@@ -303,8 +303,8 @@ class TestStorageUpgrade(WalletTestCase):
     def _sanity_check_upgraded_storage(self, storage, expect_backup=False):
         self.assertFalse(storage.requires_split())
         self.assertFalse(storage.requires_upgrade())
-        if expect_backup and os.path.exists(storage.path):
-            backup_path = f"{storage.path}.backup.{1:d}"
+        if expect_backup and os.path.exists(storage.get_path()):
+            backup_path = f"{storage.get_path()}.backup.{1:d}"
             self.assertTrue(os.path.exists(backup_path),
                 f"backup file '{backup_path}' does not exist")
 
