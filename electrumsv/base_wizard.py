@@ -94,7 +94,9 @@ class BaseWizard(object):
         ])
         choices = [
             (WalletTypes.STANDARD,  _("Standard wallet")),
-            (WalletTypes.MULTISIG,  _("Multi-signature wallet")),
+            # NOTE(rt12): Deprecating P2SH multisig without any available replacement.
+            # https://github.com/electrumsv/electrumsv/issues/215
+            # (WalletTypes.MULTISIG,  _("Multi-signature wallet")),
             (WalletTypes.IMPORTED,  _("Import Bitcoin addresses or private keys")),
         ]
         self.choice_dialog(title=title, message=message, choices=choices,
